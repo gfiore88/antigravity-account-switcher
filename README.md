@@ -3,6 +3,7 @@
 [![GitHub Release](https://img.shields.io/github/v/release/gfiore88/antigravity-account-switcher?color=blue&label=version)](https://github.com/gfiore88/antigravity-account-switcher/releases)
 [![Build Status](https://img.shields.io/github/actions/workflow/status/gfiore88/antigravity-account-switcher/release.yml?branch=main)](https://github.com/gfiore88/antigravity-account-switcher/actions)
 [![License](https://img.shields.io/github/license/gfiore88/antigravity-account-switcher)](https://github.com/gfiore88/antigravity-account-switcher/blob/main/LICENSE.md)
+
 **Switch between multiple Google accounts (with AI Pro subscriptions) seamlessly — directly inside Antigravity IDE.**
 
 ---
@@ -21,15 +22,19 @@
 ## How to Use
 
 ### 1. Open the Panel
+
 Click the **Account Switcher** icon in the **Activity Bar** (left sidebar) or click the **"Account Switcher"** button in the status bar at the bottom right.
 
 ### 2. Save Your Current Session
+
 While logged in with a Google account in Antigravity IDE:
+
 1. Type a name in the input field (e.g. `"Pro Account"`)
 2. Click **"Salva Account Corrente"**
 3. Your session is saved locally.
 
 ### 3. Switch Between Accounts
+
 1. Log in with a different Google account in the IDE.
 2. Save that session too (e.g. `"Work Account"`).
 3. From now on, click ⚡ next to any saved profile to switch instantly.
