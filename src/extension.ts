@@ -23,7 +23,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // --- Status Bar Item ---
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.command = 'antigravity.openPanel';
-  statusBarItem.text = '$(account) Account Switcher';
+  statusBarItem.text = '$(sync) Account Switcher';
   statusBarItem.tooltip = 'Open Antigravity Account Switcher';
   statusBarItem.show();
   context.subscriptions.push(statusBarItem);
@@ -98,6 +98,24 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
         case 'deleteProfile':
           await this._handleDelete(message.name);
           break;
+        case 'requestDeleteProfile':
+          vscode.window.showWarningMessage(`Vuoi davvero eliminare il profilo "${message.name}"?`, { modal: true }, 'Elimina').then(selection => {
+            if (selection === 'Elimina') { this._handleDelete(message.name); }
+          });
+          break;
+        case 'renameProfile':
+          await this._handleRename(message.oldName, message.newName);
+          break;
+        case 'requestRenameProfile':
+          vscode.window.showInputBox({
+            prompt: `Nuovo nome per il profilo "${message.name}":`,
+            value: message.name
+          }).then(newName => {
+            if (newName !== undefined && newName.trim() !== '' && newName.trim() !== message.name) {
+              this._handleRename(message.name, newName.trim());
+            }
+          });
+          break;
       }
     });
   }
@@ -142,6 +160,21 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
       await fs.remove(path.join(PROFILES_DIR, name));
       await this._postProfiles();
       this._view?.webview.postMessage({ command: 'toast', type: 'success', message: `Profilo "${name}" eliminato.` });
+    } catch (err: any) {
+      this._view?.webview.postMessage({ command: 'toast', type: 'error', message: err.message });
+    }
+  }
+
+  private async _handleRename(oldName: string, newName: string) {
+    try {
+      const oldPath = path.join(PROFILES_DIR, oldName);
+      const newPath = path.join(PROFILES_DIR, newName);
+      if (await fs.pathExists(newPath)) {
+        throw new Error('Un profilo con questo nome esiste già.');
+      }
+      await fs.rename(oldPath, newPath);
+      await this._postProfiles();
+      this._view?.webview.postMessage({ command: 'toast', type: 'success', message: `Profilo rinominato in "${newName}".` });
     } catch (err: any) {
       this._view?.webview.postMessage({ command: 'toast', type: 'error', message: err.message });
     }
@@ -292,230 +325,118 @@ function getWebviewContent(profiles: string[]): string {
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
   <title>Account Switcher</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
-      --bg-base: #0d0d18;
-      --bg-surface: rgba(255,255,255,0.04);
-      --bg-surface-hover: rgba(255,255,255,0.07);
-      --border: rgba(255,255,255,0.07);
-      --border-accent: rgba(139,92,246,0.45);
-      --accent: #8b5cf6;
-      --accent-2: #6366f1;
-      --accent-glow: rgba(139,92,246,0.25);
-      --danger: #ef4444;
-      --danger-glow: rgba(239,68,68,0.2);
-      --success: #22c55e;
-      --text-primary: #f1f5f9;
-      --text-secondary: #94a3b8;
-      --text-muted: #4a5568;
-      --radius: 10px;
-      --radius-sm: 6px;
+      --radius-sm: 4px;
     }
     body {
-      font-family: 'Inter', -apple-system, sans-serif;
-      background: var(--bg-base);
-      color: var(--text-primary);
-      min-height: 100vh;
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
       padding: 16px;
-      background-image:
-        radial-gradient(ellipse at 15% 0%, rgba(139,92,246,0.10) 0%, transparent 55%),
-        radial-gradient(ellipse at 85% 100%, rgba(99,102,241,0.08) 0%, transparent 55%);
-      font-size: 13px;
     }
-
-    /* Header */
     .header {
-      display: flex; align-items: center; gap: 10px;
+      display: flex; align-items: center; gap: 8px;
       margin-bottom: 20px;
-      padding-bottom: 14px;
-      border-bottom: 1px solid var(--border);
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--vscode-panel-border);
     }
-    .header-icon {
-      width: 32px; height: 32px;
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      border-radius: 8px;
-      display: flex; align-items: center; justify-content: center;
-      font-size: 15px;
-      box-shadow: 0 0 14px var(--accent-glow);
-      flex-shrink: 0;
-    }
-    .header-text h1 {
-      font-size: 14px; font-weight: 700; letter-spacing: -0.2px;
-      background: linear-gradient(90deg, #fff 40%, #c4b5fd);
-      -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-    }
-    .header-text p {
-      font-size: 11px; color: var(--text-muted); margin-top: 1px;
-    }
-
-    /* Section label */
+    .header h1 { font-size: 14px; font-weight: 600; margin: 0; }
+    .header p { font-size: 11px; color: var(--vscode-descriptionForeground); margin: 2px 0 0 0; }
     .section-label {
-      font-size: 10px; font-weight: 600; letter-spacing: 0.08em;
-      text-transform: uppercase; color: var(--text-muted);
+      font-size: 11px; font-weight: 600; text-transform: uppercase;
+      color: var(--vscode-sideBarTitle-foreground);
       margin-bottom: 8px;
     }
-
-    /* Add card */
-    .add-card {
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 12px;
-      margin-bottom: 20px;
-      transition: border-color 0.2s;
-    }
-    .add-card:focus-within { border-color: var(--border-accent); }
-
+    .add-card { margin-bottom: 20px; }
     .input-field {
       width: 100%;
-      background: rgba(255,255,255,0.04);
-      border: 1px solid var(--border);
+      background: var(--vscode-input-background);
+      border: 1px solid var(--vscode-input-border);
+      color: var(--vscode-input-foreground);
+      padding: 6px 8px;
       border-radius: var(--radius-sm);
-      padding: 8px 11px;
-      color: var(--text-primary);
-      font-family: 'Inter', sans-serif;
-      font-size: 13px;
       outline: none;
-      transition: border-color 0.2s, box-shadow 0.2s;
       margin-bottom: 8px;
+      font-family: inherit;
     }
-    .input-field::placeholder { color: var(--text-muted); }
-    .input-field:focus {
-      border-color: var(--accent);
-      box-shadow: 0 0 0 2px var(--accent-glow);
-    }
-
+    .input-field:focus { border-color: var(--vscode-focusBorder); }
     .btn {
-      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
-      padding: 8px 14px;
-      border: none; border-radius: var(--radius-sm);
-      font-family: 'Inter', sans-serif;
-      font-size: 12px; font-weight: 600;
-      cursor: pointer;
-      transition: all 0.18s ease;
       width: 100%;
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none;
+      padding: 6px 12px;
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      font-family: inherit;
+      font-size: 12px;
     }
-    .btn-primary {
-      background: linear-gradient(135deg, var(--accent), var(--accent-2));
-      color: #fff;
-      box-shadow: 0 3px 12px var(--accent-glow);
-    }
-    .btn-primary:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 5px 16px var(--accent-glow);
-    }
-    .btn-primary:active { transform: translateY(0); }
-
-    /* Profile cards */
-    .profiles-list {
-      display: flex; flex-direction: column; gap: 8px;
-    }
+    .btn:hover { background: var(--vscode-button-hoverBackground); }
+    .profiles-list { display: flex; flex-direction: column; gap: 6px; }
     .empty-state {
-      text-align: center; padding: 32px 16px;
-      background: var(--bg-surface);
-      border: 1px dashed var(--border);
-      border-radius: var(--radius);
+      text-align: center; padding: 20px;
+      color: var(--vscode-descriptionForeground);
+      border: 1px dashed var(--vscode-panel-border);
+      border-radius: var(--radius-sm);
+      font-size: 12px;
     }
-    .empty-state .emoji { font-size: 28px; margin-bottom: 10px; display: block; }
-    .empty-state p { color: var(--text-muted); font-size: 12px; line-height: 1.6; }
-
     .profile-card {
       display: flex; align-items: center; gap: 10px;
-      background: var(--bg-surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 10px 12px;
-      transition: border-color 0.2s, background 0.2s, transform 0.18s;
-      animation: slideIn 0.25s ease backwards;
+      background: var(--vscode-list-inactiveSelectionBackground);
+      border: 1px solid transparent;
+      padding: 8px 10px;
+      border-radius: var(--radius-sm);
+      transition: background 0.1s;
     }
-    .profile-card:hover {
-      border-color: rgba(139,92,246,0.28);
-      background: var(--bg-surface-hover);
-      transform: translateX(2px);
-    }
-    @keyframes slideIn {
-      from { opacity: 0; transform: translateY(8px); }
-      to   { opacity: 1; transform: translateY(0); }
-    }
-
+    .profile-card:hover { background: var(--vscode-list-hoverBackground); }
     .profile-avatar {
-      width: 32px; height: 32px;
+      width: 28px; height: 28px;
       border-radius: 50%;
       display: flex; align-items: center; justify-content: center;
-      font-weight: 700; font-size: 12px; color: #fff;
+      font-weight: 600; font-size: 11px; color: #fff;
       flex-shrink: 0;
     }
     .profile-info { flex: 1; min-width: 0; }
-    .profile-name {
-      font-size: 13px; font-weight: 600;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    }
-    .profile-sub { font-size: 10px; color: var(--text-muted); margin-top: 1px; }
-
-    .profile-actions { display: flex; gap: 4px; flex-shrink: 0; }
+    .profile-name { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .profile-sub { font-size: 11px; color: var(--vscode-descriptionForeground); margin-top: 2px; }
+    .profile-actions { display: flex; gap: 4px; }
     .btn-icon {
-      width: 28px; height: 28px;
-      display: flex; align-items: center; justify-content: center;
-      border: none; border-radius: var(--radius-sm);
-      cursor: pointer; font-size: 13px;
-      transition: all 0.15s;
-    }
-    .btn-switch-sm {
-      background: rgba(139,92,246,0.12);
-      color: var(--accent);
-      border: 1px solid rgba(139,92,246,0.2);
-    }
-    .btn-switch-sm:hover {
-      background: rgba(139,92,246,0.22);
-      border-color: var(--accent);
-    }
-    .btn-delete-sm {
       background: transparent;
-      color: var(--text-muted);
+      color: var(--vscode-icon-foreground);
       border: 1px solid transparent;
+      border-radius: 4px;
+      padding: 4px 6px;
+      cursor: pointer;
+      font-size: 14px;
     }
-    .btn-delete-sm:hover {
-      background: var(--danger-glow);
-      color: var(--danger);
-      border-color: rgba(239,68,68,0.3);
-    }
-
-    /* Toast */
+    .btn-icon:hover { background: var(--vscode-toolbar-hoverBackground); }
     .toast-container {
       position: fixed; bottom: 12px; left: 12px; right: 12px;
       display: flex; flex-direction: column; gap: 6px;
       z-index: 9999;
     }
     .toast {
-      display: flex; align-items: center; gap: 8px;
-      padding: 10px 14px;
+      padding: 8px 12px;
       border-radius: var(--radius-sm);
-      font-size: 12px; font-weight: 500;
-      backdrop-filter: blur(16px);
-      animation: toastIn 0.25s ease, toastOut 0.25s ease 2.75s forwards;
-      box-shadow: 0 6px 24px rgba(0,0,0,0.4);
+      font-size: 12px;
+      background: var(--vscode-notifications-background);
+      color: var(--vscode-notifications-foreground);
+      border: 1px solid var(--vscode-notifications-border);
+      box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+      animation: toastIn 0.2s ease, toastOut 0.2s ease 2.8s forwards;
     }
-    .toast.success {
-      background: rgba(22,163,74,0.18);
-      border: 1px solid rgba(34,197,94,0.35);
-      color: #86efac;
-    }
-    .toast.error {
-      background: rgba(185,28,28,0.18);
-      border: 1px solid rgba(239,68,68,0.35);
-      color: #fca5a5;
-    }
-    @keyframes toastIn  { from { opacity:0; transform:translateY(8px); } to { opacity:1; transform:translateY(0); } }
+    .toast.success { border-left: 3px solid var(--vscode-notificationsInfoIcon-foreground); }
+    .toast.error { border-left: 3px solid var(--vscode-notificationsErrorIcon-foreground); }
+    @keyframes toastIn  { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
     @keyframes toastOut { from { opacity:1; } to { opacity:0; } }
   </style>
 </head>
 <body>
   <div class="header">
-    <div class="header-icon">⚡</div>
-    <div class="header-text">
+    <div>
       <h1>Account Switcher</h1>
       <p>Antigravity IDE</p>
     </div>
@@ -523,26 +444,17 @@ function getWebviewContent(profiles: string[]): string {
 
   <div class="section-label">Salva sessione corrente</div>
   <div class="add-card">
-    <input class="input-field" id="profileNameInput" type="text"
-      placeholder="Nome profilo (es. Pro, Lavoro...)" maxlength="40"/>
-    <button class="btn btn-primary" id="saveBtn">💾 Salva Account Corrente</button>
+    <input class="input-field" id="profileNameInput" type="text" placeholder="Nome profilo" maxlength="40"/>
+    <button class="btn" id="saveBtn">Salva Profilo</button>
   </div>
 
   <div class="section-label">Profili Salvati</div>
   <div class="profiles-list" id="profilesList"></div>
-
   <div class="toast-container" id="toastContainer"></div>
 
   <script>
     const vscode = acquireVsCodeApi();
-    const COLORS = [
-      'linear-gradient(135deg,#8b5cf6,#6366f1)',
-      'linear-gradient(135deg,#06b6d4,#3b82f6)',
-      'linear-gradient(135deg,#f59e0b,#ef4444)',
-      'linear-gradient(135deg,#10b981,#06b6d4)',
-      'linear-gradient(135deg,#ec4899,#8b5cf6)',
-      'linear-gradient(135deg,#f97316,#eab308)',
-    ];
+    const COLORS = ['#4d78cc', '#6b5b95', '#b565a7', '#009688', '#e91e63', '#ff9800'];
     function getColor(name) {
       let h = 0; for (let i=0;i<name.length;i++){h=name.charCodeAt(i)+((h<<5)-h);}
       return COLORS[Math.abs(h)%COLORS.length];
@@ -554,22 +466,22 @@ function getWebviewContent(profiles: string[]): string {
     function renderProfiles(profiles) {
       const list = document.getElementById('profilesList');
       if (!profiles || profiles.length === 0) {
-        list.innerHTML = \`<div class="empty-state">
-          <span class="emoji">🌐</span>
-          <p>Nessun profilo salvato.<br/>Fai login nell'IDE, poi<br/>salva la sessione qui sopra.</p>
-        </div>\`;
+        list.innerHTML = \`<div class="empty-state">Nessun profilo salvato.</div>\`;
         return;
       }
-      list.innerHTML = profiles.map((name,i) => \`
-        <div class="profile-card" style="animation-delay:\${i*0.04}s">
+      list.innerHTML = profiles.map(name => \`
+        <div class="profile-card">
           <div class="profile-avatar" style="background:\${getColor(name)}">\${getInitials(name)}</div>
           <div class="profile-info">
             <div class="profile-name">\${esc(name)}</div>
-            <div class="profile-sub">Profilo Google salvato</div>
+            <div class="profile-sub">Profilo Google</div>
           </div>
           <div class="profile-actions">
-            <button class="btn-icon btn-switch-sm" title="Switch a questo account" onclick="switchProfile('\${escJs(name)}')">⚡</button>
-            <button class="btn-icon btn-delete-sm" title="Elimina profilo" onclick="deleteProfile('\${escJs(name)}')">🗑</button>
+            <button class="btn-icon" title="Switch" onclick="switchProfile('\${escJs(name)}')">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12c0-4.4 3.6-8 8-8 2.2 0 4.2.9 5.7 2.3L20 9"/><path d="M15 9h5V4"/><path d="M20 12c0 4.4-3.6 8-8 8-2.2 0-4.2-.9-5.7-2.3L4 15"/><path d="M9 15H4v5"/></svg>
+            </button>
+            <button class="btn-icon" title="Rinomina" onclick="promptRenameProfile('\${escJs(name)}')">✏️</button>
+            <button class="btn-icon" title="Elimina" onclick="promptDeleteProfile('\${escJs(name)}')">🗑</button>
           </div>
         </div>\`).join('');
     }
@@ -578,23 +490,31 @@ function getWebviewContent(profiles: string[]): string {
       const c = document.getElementById('toastContainer');
       const t = document.createElement('div');
       t.className = 'toast ' + type;
-      t.innerHTML = (type==='success'?'✅':'❌') + ' ' + esc(message);
+      t.innerHTML = esc(message);
       c.appendChild(t);
-      setTimeout(() => t.remove(), 3100);
+      setTimeout(() => t.remove(), 3000);
     }
 
     document.getElementById('saveBtn').addEventListener('click', () => {
       const input = document.getElementById('profileNameInput');
       const name = input.value.trim();
-      if (!name) { showToast('error','Inserisci un nome per il profilo.'); input.focus(); return; }
+      if (!name) { showToast('error','Nome vuoto.'); input.focus(); return; }
       vscode.postMessage({command:'saveProfile', name});
       input.value = '';
     });
     document.getElementById('profileNameInput').addEventListener('keydown', e => {
       if (e.key === 'Enter') document.getElementById('saveBtn').click();
     });
+    
     function switchProfile(name){ vscode.postMessage({command:'switchProfile', name}); }
-    function deleteProfile(name){ vscode.postMessage({command:'deleteProfile', name}); }
+    
+    function promptDeleteProfile(name) {
+      vscode.postMessage({command:'requestDeleteProfile', name});
+    }
+
+    function promptRenameProfile(name) {
+      vscode.postMessage({command:'requestRenameProfile', name});
+    }
 
     window.addEventListener('message', event => {
       const msg = event.data;

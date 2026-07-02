@@ -4,9 +4,17 @@
   "description": "Switch between multiple Google accounts (with AI Pro subscriptions) seamlessly in Antigravity IDE — with a beautiful built-in UI panel.",
   "version": "1.0.0",
   "publisher": "gfiore88",
+  "author": {
+    "name": "Giovanni Fiore",
+    "url": "https://www.giovannifiore.net"
+  },
   "icon": "icon.png",
   "engines": {
     "vscode": "^1.80.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/gfiore88/antigravity-account-switcher"
   },
   "categories": [
     "Other"
@@ -27,7 +35,10 @@
       {
         "command": "antigravity.openPanel",
         "title": "Antigravity: Open Account Switcher",
-        "icon": "$(account)"
+        "icon": {
+          "light": "icon.png",
+          "dark": "icon.png"
+        }
       },
       {
         "command": "antigravity.switchAccount",
@@ -43,7 +54,7 @@
         {
           "id": "antigravity-account-switcher",
           "title": "Account Switcher",
-          "icon": "$(account)"
+          "icon": "icon.png"
         }
       ]
     },
@@ -69,6 +80,12 @@
         {
           "command": "antigravity.saveCurrentAccount",
           "when": "true"
+        }
+      ],
+      "editor/title": [
+        {
+          "command": "antigravity.openPanel",
+          "group": "navigation"
         }
       ]
     }
