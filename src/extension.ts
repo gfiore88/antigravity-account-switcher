@@ -213,16 +213,30 @@ const vscdbPath = process.argv[2];
 const ideStatePath = process.argv[3];
 const appPath = process.argv[4];
 
+try {
+    execSync('osascript -e \\'tell application "Antigravity IDE" to quit\\'');
+} catch(e) {}
+
 let attempts = 0;
 while (attempts < 20) {
     try {
-        execSync('pgrep -x "Antigravity IDE"');
+        const isRunning = execSync('osascript -e \\'application "Antigravity IDE" is running\\'').toString().trim();
+        if (isRunning === 'false') {
+            break;
+        }
         execSync('sleep 0.5');
         attempts++;
     } catch(e) {
         break; 
     }
 }
+
+try {
+    const isRunning = execSync('osascript -e \\'application "Antigravity IDE" is running\\'').toString().trim();
+    if (isRunning === 'true') {
+        execSync('pkill -9 -f "Antigravity IDE.app"');
+    }
+} catch(e) {}
 
 execSync('sleep 0.8'); // Extra safety buffer
 
@@ -244,7 +258,14 @@ if (fs.existsSync(ideStatePath)) {
     if (state.userStatus) setSqlite('antigravityUnifiedStateSync.userStatus', state.userStatus);
 }
 
-execSync(\`open -a "\${appPath}"\`);
+// Clean environment variables before restarting to prevent Launch Services issues
+for (const key in process.env) {
+    if (key.startsWith('VSCODE_') || key.startsWith('ELECTRON_') || key === 'TERM_PROGRAM' || key === 'TERM_PROGRAM_VERSION') {
+        delete process.env[key];
+    }
+}
+
+execSync(\`open -n -a "\${appPath}"\`);
   `;
 
   const scriptPath = path.join(PROFILES_DIR, 'switcher.js');
