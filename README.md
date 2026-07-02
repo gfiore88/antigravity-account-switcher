@@ -1,5 +1,8 @@
 # Antigravity Account Switcher
 
+[![GitHub Release](https://img.shields.io/github/v/release/gfiore88/antigravity-account-switcher?color=blue&label=version)](https://github.com/gfiore88/antigravity-account-switcher/releases)
+[![Build Status](https://img.shields.io/github/actions/workflow/status/gfiore88/antigravity-account-switcher/release.yml?branch=main)](https://github.com/gfiore88/antigravity-account-switcher/actions)
+[![License](https://img.shields.io/github/license/gfiore88/antigravity-account-switcher)](https://github.com/gfiore88/antigravity-account-switcher/blob/main/LICENSE.md)
 **Switch between multiple Google accounts (with AI Pro subscriptions) seamlessly — directly inside Antigravity IDE.**
 
 ---
