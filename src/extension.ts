@@ -123,7 +123,8 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
   private async _renderView() {
     if (!this._view) { return; }
     const profiles = await getSavedProfiles();
-    this._view.webview.html = getWebviewContent(profiles);
+    const loggedIn = await checkIsLoggedIn();
+    this._view.webview.html = getWebviewContent(profiles, loggedIn);
   }
 
   private async _postProfiles() {
@@ -195,6 +196,26 @@ async function getSqliteValue(key: string): Promise<string | null> {
   }
 }
 
+async function checkIsLoggedIn(): Promise<boolean> {
+  const oauthToken = await getSqliteValue('antigravityUnifiedStateSync.oauthToken');
+  if (oauthToken) {
+    try {
+      const decoded = Buffer.from(oauthToken, 'base64').toString('utf8');
+      if (decoded.includes('"state":"signedIn"')) return true;
+    } catch (e) {}
+  }
+  
+  const userStatus = await getSqliteValue('antigravityUnifiedStateSync.userStatus');
+  if (userStatus) {
+    try {
+      const decoded = Buffer.from(userStatus, 'base64').toString('utf8');
+      if (decoded.includes('"state":"signedIn"')) return true;
+    } catch (e) {}
+  }
+  
+  return false;
+}
+
 async function getSavedProfiles(): Promise<string[]> {
   await fs.ensureDir(PROFILES_DIR);
   const items = await fs.readdir(PROFILES_DIR);
@@ -218,7 +239,8 @@ async function saveCurrentProfile(name: string) {
   const oauthToken = await getSqliteValue('antigravityUnifiedStateSync.oauthToken');
   const userStatus = await getSqliteValue('antigravityUnifiedStateSync.userStatus');
   
-  if (!oauthToken && !userStatus) {
+  const loggedIn = await checkIsLoggedIn();
+  if (!loggedIn) {
     throw new Error("Nessuna sessione Google attiva trovata nell'IDE. Fai prima il login.");
   }
 
@@ -317,7 +339,7 @@ execSync(\`open -n -a "\${appPath}"\`);
 // -------------------------------------------------------------------
 // WebView HTML
 // -------------------------------------------------------------------
-function getWebviewContent(profiles: string[]): string {
+function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
   const profilesJson = JSON.stringify(profiles);
   return `<!DOCTYPE html>
 <html lang="it">
@@ -443,10 +465,18 @@ function getWebviewContent(profiles: string[]): string {
   </div>
 
   <div class="section-label">Salva sessione corrente</div>
+  ${isLoggedIn ? `
   <div class="add-card">
     <input class="input-field" id="profileNameInput" type="text" placeholder="Nome profilo" maxlength="40"/>
     <button class="btn" id="saveBtn">Salva Profilo</button>
   </div>
+  ` : `
+  <div class="add-card" style="padding: 10px; background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); border-radius: var(--radius-sm); margin-bottom: 20px;">
+    <p style="font-size: 11px; color: var(--vscode-foreground); margin: 0; line-height: 1.4;">
+      ⚠️ Effettua prima il login con Google in Antigravity IDE per poter salvare il profilo.
+    </p>
+  </div>
+  `}
 
   <div class="section-label">Profili Salvati</div>
   <div class="profiles-list" id="profilesList"></div>
@@ -495,16 +525,19 @@ function getWebviewContent(profiles: string[]): string {
       setTimeout(() => t.remove(), 3000);
     }
 
-    document.getElementById('saveBtn').addEventListener('click', () => {
-      const input = document.getElementById('profileNameInput');
-      const name = input.value.trim();
-      if (!name) { showToast('error','Nome vuoto.'); input.focus(); return; }
-      vscode.postMessage({command:'saveProfile', name});
-      input.value = '';
-    });
-    document.getElementById('profileNameInput').addEventListener('keydown', e => {
-      if (e.key === 'Enter') document.getElementById('saveBtn').click();
-    });
+    const saveBtn = document.getElementById('saveBtn');
+    if (saveBtn) {
+      saveBtn.addEventListener('click', () => {
+        const input = document.getElementById('profileNameInput');
+        const name = input.value.trim();
+        if (!name) { showToast('error','Nome vuoto.'); input.focus(); return; }
+        vscode.postMessage({command:'saveProfile', name});
+        input.value = '';
+      });
+      document.getElementById('profileNameInput').addEventListener('keydown', e => {
+        if (e.key === 'Enter') saveBtn.click();
+      });
+    }
     
     function switchProfile(name){ vscode.postMessage({command:'switchProfile', name}); }
     
