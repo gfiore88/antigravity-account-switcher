@@ -388,8 +388,13 @@ for (const key in process.env) {
 }
 
 try {
-    if (isMac && appPath === "Antigravity IDE") {
-        execSync('open -n -a "Antigravity IDE"');
+    if (isMac) {
+        const appMatch = appPath.match(/(.*\.app)/);
+        if (appMatch) {
+            execSync(\`open -n "\${appMatch[1]}"\`);
+        } else {
+            execSync('open -n -a "Antigravity IDE"');
+        }
     } else {
         const { spawn } = require('child_process');
         const child = spawn(appPath, [], {
