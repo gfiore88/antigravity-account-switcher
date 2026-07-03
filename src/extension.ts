@@ -10,7 +10,16 @@ const execAsync = promisify(exec);
 const GEMINI_DIR = path.join(os.homedir(), '.gemini');
 const BROWSER_PROFILE_PATH = path.join(GEMINI_DIR, 'antigravity-browser-profile');
 const PROFILES_DIR = path.join(GEMINI_DIR, 'antigravity-account-switcher-profiles');
-const VSCDB_PATH = path.join(os.homedir(), 'Library', 'Application Support', 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb');
+
+let appDataPath: string;
+if (os.platform() === 'win32') {
+    appDataPath = process.env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming');
+} else if (os.platform() === 'darwin') {
+    appDataPath = path.join(os.homedir(), 'Library', 'Application Support');
+} else {
+    appDataPath = process.env.XDG_CONFIG_HOME || path.join(os.homedir(), '.config');
+}
+const VSCDB_PATH = path.join(appDataPath, 'Antigravity IDE', 'User', 'globalStorage', 'state.vscdb');
 
 interface IdeState {
   oauthToken: string | null;
@@ -284,22 +293,50 @@ async function switchProfile(name: string) {
   const scriptContent = `
 const { execSync } = require('child_process');
 const fs = require('fs');
+const os = require('os');
 const vscdbPath = process.argv[2];
 const ideStatePath = process.argv[3];
 const appPath = process.argv[4];
 
+const isMac = os.platform() === 'darwin';
+const isWin = os.platform() === 'win32';
+
 try {
-    execSync('osascript -e \\'tell application "Antigravity IDE" to quit\\'');
+    if (isMac) {
+        execSync('osascript -e \\'tell application "Antigravity IDE" to quit\\'');
+    } else if (isWin) {
+        execSync('taskkill /IM "Antigravity IDE.exe"');
+    } else {
+        execSync('pkill -f "Antigravity IDE"');
+    }
 } catch(e) {}
 
 let attempts = 0;
 while (attempts < 20) {
     try {
-        const isRunning = execSync('osascript -e \\'application "Antigravity IDE" is running\\'').toString().trim();
-        if (isRunning === 'false') {
+        let isRunning = false;
+        if (isMac) {
+            const res = execSync('osascript -e \\'application "Antigravity IDE" is running\\'').toString().trim();
+            isRunning = (res === 'true');
+        } else if (isWin) {
+            const res = execSync('tasklist /FI "IMAGENAME eq Antigravity IDE.exe"').toString();
+            isRunning = res.includes('Antigravity IDE.exe');
+        } else {
+            try {
+                execSync('pgrep -f "Antigravity IDE"');
+                isRunning = true;
+            } catch(e) {
+                isRunning = false;
+            }
+        }
+        if (!isRunning) {
             break;
         }
-        execSync('sleep 0.5');
+        if (isWin) {
+            try { execSync('timeout /t 1 /nobreak > NUL'); } catch(e) {}
+        } else {
+            execSync('sleep 0.5');
+        }
         attempts++;
     } catch(e) {
         break; 
@@ -307,13 +344,23 @@ while (attempts < 20) {
 }
 
 try {
-    const isRunning = execSync('osascript -e \\'application "Antigravity IDE" is running\\'').toString().trim();
-    if (isRunning === 'true') {
-        execSync('pkill -9 -f "Antigravity IDE.app"');
+    if (isMac) {
+        const res = execSync('osascript -e \\'application "Antigravity IDE" is running\\'').toString().trim();
+        if (res === 'true') {
+            execSync('pkill -9 -f "Antigravity IDE.app"');
+        }
+    } else if (isWin) {
+        execSync('taskkill /IM "Antigravity IDE.exe" /F');
+    } else {
+        execSync('pkill -9 -f "Antigravity IDE"');
     }
 } catch(e) {}
 
-execSync('sleep 0.8'); // Extra safety buffer
+if (isWin) {
+    try { execSync('timeout /t 1 /nobreak > NUL'); } catch(e) {}
+} else {
+    try { execSync('sleep 0.8'); } catch(e) {}
+}
 
 if (fs.existsSync(ideStatePath)) {
     const state = JSON.parse(fs.readFileSync(ideStatePath, 'utf8'));
@@ -340,14 +387,25 @@ for (const key in process.env) {
     }
 }
 
-execSync(\`open -n -a "\${appPath}"\`);
+try {
+    if (isMac && appPath === "Antigravity IDE") {
+        execSync('open -n -a "Antigravity IDE"');
+    } else {
+        const { spawn } = require('child_process');
+        const child = spawn(appPath, [], {
+            detached: true,
+            stdio: 'ignore'
+        });
+        child.unref();
+    }
+} catch(e) {}
   `;
 
   const scriptPath = path.join(PROFILES_DIR, 'switcher.js');
   await fs.writeFile(scriptPath, scriptContent);
 
   const { spawn } = require('child_process');
-  const child = spawn('node', [scriptPath, VSCDB_PATH, statePath, 'Antigravity IDE'], {
+  const child = spawn('node', [scriptPath, VSCDB_PATH, statePath, process.execPath || 'Antigravity IDE'], {
     detached: true,
     stdio: 'ignore'
   });
