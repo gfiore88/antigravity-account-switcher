@@ -2,14 +2,21 @@ import * as vscode from 'vscode';
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs-extra';
-import { exec } from 'child_process';
+import { execFile, spawn } from 'child_process';
 import { promisify } from 'util';
 
-const execAsync = promisify(exec);
+const execFileAsync = promisify(execFile);
 
 const GEMINI_DIR = path.join(os.homedir(), '.gemini');
 const BROWSER_PROFILE_PATH = path.join(GEMINI_DIR, 'antigravity-browser-profile');
 const PROFILES_DIR = path.join(GEMINI_DIR, 'antigravity-account-switcher-profiles');
+const SECURE_DIR_MODE = 0o700;
+const SECURE_FILE_MODE = 0o600;
+const PROFILE_NAME_MAX_LENGTH = 40;
+const INTERNAL_PREFIX = '_';
+const SQLITE_OAUTH_TOKEN_KEY = 'antigravityUnifiedStateSync.oauthToken';
+const SQLITE_USER_STATUS_KEY = 'antigravityUnifiedStateSync.userStatus';
+let sqliteAvailabilityCheck: Promise<void> | undefined;
 
 let appDataPath: string;
 if (os.platform() === 'win32') {
@@ -26,8 +33,130 @@ interface IdeState {
   userStatus: string | null;
 }
 
+function errorMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+function normalizeProfileName(value: unknown): string {
+  if (typeof value !== 'string') {
+    throw new Error('Nome profilo non valido.');
+  }
+
+  const name = value.trim();
+  if (!name) {
+    throw new Error('Il nome non può essere vuoto.');
+  }
+  if (name.length > PROFILE_NAME_MAX_LENGTH) {
+    throw new Error(`Il nome non può superare ${PROFILE_NAME_MAX_LENGTH} caratteri.`);
+  }
+  if (name === '.' || name === '..' || name.startsWith(INTERNAL_PREFIX)) {
+    throw new Error('Nome profilo riservato.');
+  }
+  if (/[\\/]/.test(name) || /[\x00-\x1f]/.test(name)) {
+    throw new Error('Il nome profilo non può contenere separatori di percorso o caratteri di controllo.');
+  }
+  if (os.platform() === 'win32') {
+    const windowsReserved = /^(con|prn|aux|nul|com[1-9]|lpt[1-9])(\..*)?$/i;
+    if (/[<>:"|?*]/.test(name) || /[. ]$/.test(name) || windowsReserved.test(name)) {
+      throw new Error('Nome profilo non valido su Windows.');
+    }
+  }
+
+  return name;
+}
+
+function getProfilePath(value: unknown): { name: string; profilePath: string } {
+  const name = normalizeProfileName(value);
+  const root = path.resolve(PROFILES_DIR);
+  const profilePath = path.resolve(root, name);
+  const relative = path.relative(root, profilePath);
+
+  if (!relative || relative.startsWith('..') || path.isAbsolute(relative)) {
+    throw new Error('Percorso profilo non valido.');
+  }
+
+  return { name, profilePath };
+}
+
+function getInternalPath(prefix: string): string {
+  const suffix = `${Date.now()}-${Math.random().toString(36).slice(2)}`;
+  return path.join(PROFILES_DIR, `${INTERNAL_PREFIX}${prefix}-${suffix}`);
+}
+
+async function chmodIfSupported(targetPath: string, mode: number) {
+  if (os.platform() === 'win32') {
+    return;
+  }
+
+  try {
+    await fs.chmod(targetPath, mode);
+  } catch (err) {
+    console.warn(`Unable to chmod ${targetPath}:`, err);
+  }
+}
+
+async function ensureSecureDir(dirPath: string) {
+  await fs.ensureDir(dirPath);
+  await chmodIfSupported(dirPath, SECURE_DIR_MODE);
+}
+
+async function writeSecureJson(filePath: string, data: unknown) {
+  await fs.writeJson(filePath, data, { spaces: 2, mode: SECURE_FILE_MODE });
+  await chmodIfSupported(filePath, SECURE_FILE_MODE);
+}
+
+async function hardenProfileDirectory(profilePath: string) {
+  if (await fs.pathExists(profilePath)) {
+    await chmodIfSupported(profilePath, SECURE_DIR_MODE);
+  }
+
+  const statePath = path.join(profilePath, 'ide_state.json');
+  if (await fs.pathExists(statePath)) {
+    await chmodIfSupported(statePath, SECURE_FILE_MODE);
+  }
+}
+
+async function hardenExistingProfileStorage() {
+  await ensureSecureDir(PROFILES_DIR);
+  if (await fs.pathExists(BROWSER_PROFILE_PATH)) {
+    await chmodIfSupported(BROWSER_PROFILE_PATH, SECURE_DIR_MODE);
+  }
+
+  const items = await fs.readdir(PROFILES_DIR);
+  for (const item of items) {
+    try {
+      const itemPath = path.join(PROFILES_DIR, item);
+      const stat = await fs.lstat(itemPath);
+      if (stat.isDirectory()) {
+        await hardenProfileDirectory(itemPath);
+      } else if (item === 'switcher.js') {
+        await chmodIfSupported(itemPath, SECURE_FILE_MODE);
+      }
+    } catch (err) {
+      console.warn(`Unable to harden profile storage item "${item}":`, err);
+    }
+  }
+}
+
+function escapeSqlValue(value: string): string {
+  return value.replace(/'/g, "''");
+}
+
+async function ensureSqliteAvailable() {
+  if (!sqliteAvailabilityCheck) {
+    sqliteAvailabilityCheck = execFileAsync('sqlite3', ['--version'])
+      .then(() => undefined)
+      .catch((err) => {
+        sqliteAvailabilityCheck = undefined;
+        throw new Error(`sqlite3 non è disponibile nel PATH. Installa sqlite3 o aggiungilo al PATH prima di usare Account Switcher. Dettaglio: ${errorMessage(err)}`);
+      });
+  }
+
+  await sqliteAvailabilityCheck;
+}
+
 export async function activate(context: vscode.ExtensionContext) {
-  await fs.ensureDir(PROFILES_DIR);
+  await hardenExistingProfileStorage();
 
   // --- Status Bar Item ---
   const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
@@ -52,16 +181,20 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('antigravity.switchAccount', async () => {
-      const profiles = await getSavedProfiles();
-      if (profiles.length === 0) {
-        vscode.window.showInformationMessage('Nessun profilo salvato. Usa il pannello Account Switcher per salvarne uno.');
-        return;
+      try {
+        const profiles = await getSavedProfiles();
+        if (profiles.length === 0) {
+          vscode.window.showInformationMessage('Nessun profilo salvato. Usa il pannello Account Switcher per salvarne uno.');
+          return;
+        }
+        const selected = await vscode.window.showQuickPick(
+          profiles.map(p => ({ label: p, description: 'Profilo salvato' })),
+          { placeHolder: 'Seleziona il profilo Google a cui vuoi passare' }
+        );
+        if (selected) { await switchProfile(selected.label); }
+      } catch (err) {
+        vscode.window.showErrorMessage(errorMessage(err));
       }
-      const selected = await vscode.window.showQuickPick(
-        profiles.map(p => ({ label: p, description: 'Profilo salvato' })),
-        { placeHolder: 'Seleziona il profilo Google a cui vuoi passare' }
-      );
-      if (selected) { await switchProfile(selected.label); }
     })
   );
 
@@ -71,8 +204,12 @@ export async function activate(context: vscode.ExtensionContext) {
         prompt: 'Inserisci un nome per il profilo corrente (es. Personale, Lavoro, Pro 1)'
       });
       if (name) {
-        await saveCurrentProfile(name);
-        vscode.window.showInformationMessage(`Profilo '${name}' salvato con successo!`);
+        try {
+          const savedName = await saveCurrentProfile(name);
+          vscode.window.showInformationMessage(`Profilo '${savedName}' salvato con successo!`);
+        } catch (err) {
+          vscode.window.showErrorMessage(errorMessage(err));
+        }
       }
     })
   );
@@ -85,6 +222,10 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
   private _view?: vscode.WebviewView;
 
   constructor(private readonly _extensionUri: vscode.Uri) {}
+
+  private _postToast(type: 'success' | 'error', message: string) {
+    this._view?.webview.postMessage({ command: 'toast', type, message });
+  }
 
   public resolveWebviewView(
     webviewView: vscode.WebviewView,
@@ -120,22 +261,13 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
           await this._handleDelete(message.name);
           break;
         case 'requestDeleteProfile':
-          vscode.window.showWarningMessage(`Vuoi davvero eliminare il profilo "${message.name}"?`, { modal: true }, 'Elimina').then(selection => {
-            if (selection === 'Elimina') { this._handleDelete(message.name); }
-          });
+          await this._requestDelete(message.name);
           break;
         case 'renameProfile':
           await this._handleRename(message.oldName, message.newName);
           break;
         case 'requestRenameProfile':
-          vscode.window.showInputBox({
-            prompt: `Nuovo nome per il profilo "${message.name}":`,
-            value: message.name
-          }).then(newName => {
-            if (newName !== undefined && newName.trim() !== '' && newName.trim() !== message.name) {
-              this._handleRename(message.name, newName.trim());
-            }
-          });
+          await this._requestRename(message.name);
           break;
       }
     });
@@ -163,50 +295,86 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
   }
 
   private async _handleSave(name: string) {
-    if (!name?.trim()) {
-      this._view?.webview.postMessage({ command: 'toast', type: 'error', message: 'Il nome non può essere vuoto.' });
-      return;
-    }
     try {
-      await saveCurrentProfile(name.trim());
+      const savedName = await saveCurrentProfile(name);
       await this._postProfiles();
-      this._view?.webview.postMessage({ command: 'toast', type: 'success', message: `Profilo "${name}" salvato!` });
-    } catch (err: any) {
-      this._view?.webview.postMessage({ command: 'toast', type: 'error', message: err.message });
+      this._postToast('success', `Profilo "${savedName}" salvato!`);
+    } catch (err) {
+      this._postToast('error', errorMessage(err));
     }
   }
 
   private async _handleSwitch(name: string) {
     try {
-      this._view?.webview.postMessage({ command: 'toast', type: 'success', message: `Switching a "${name}"... L'IDE si ricaricherà.` });
+      const profileName = normalizeProfileName(name);
+      this._postToast('success', `Switching a "${profileName}"... L'IDE si ricaricherà.`);
       await switchProfile(name);
-    } catch (err: any) {
-      this._view?.webview.postMessage({ command: 'toast', type: 'error', message: err.message });
+    } catch (err) {
+      this._postToast('error', errorMessage(err));
     }
   }
 
   private async _handleDelete(name: string) {
     try {
-      await fs.remove(path.join(PROFILES_DIR, name));
+      const { name: profileName, profilePath } = getProfilePath(name);
+      await fs.remove(profilePath);
       await this._postProfiles();
-      this._view?.webview.postMessage({ command: 'toast', type: 'success', message: `Profilo "${name}" eliminato.` });
-    } catch (err: any) {
-      this._view?.webview.postMessage({ command: 'toast', type: 'error', message: err.message });
+      this._postToast('success', `Profilo "${profileName}" eliminato.`);
+    } catch (err) {
+      this._postToast('error', errorMessage(err));
     }
   }
 
   private async _handleRename(oldName: string, newName: string) {
     try {
-      const oldPath = path.join(PROFILES_DIR, oldName);
-      const newPath = path.join(PROFILES_DIR, newName);
+      const { name: safeOldName, profilePath: oldPath } = getProfilePath(oldName);
+      const { name: safeNewName, profilePath: newPath } = getProfilePath(newName);
+      if (safeOldName === safeNewName) {
+        return;
+      }
+      if (!await fs.pathExists(oldPath)) {
+        throw new Error('Il profilo selezionato non esiste.');
+      }
       if (await fs.pathExists(newPath)) {
         throw new Error('Un profilo con questo nome esiste già.');
       }
       await fs.rename(oldPath, newPath);
+      await hardenProfileDirectory(newPath);
       await this._postProfiles();
-      this._view?.webview.postMessage({ command: 'toast', type: 'success', message: `Profilo rinominato in "${newName}".` });
-    } catch (err: any) {
-      this._view?.webview.postMessage({ command: 'toast', type: 'error', message: err.message });
+      this._postToast('success', `Profilo rinominato in "${safeNewName}".`);
+    } catch (err) {
+      this._postToast('error', errorMessage(err));
+    }
+  }
+
+  private async _requestDelete(name: string) {
+    try {
+      const profileName = normalizeProfileName(name);
+      const selection = await vscode.window.showWarningMessage(
+        `Vuoi davvero eliminare il profilo "${profileName}"?`,
+        { modal: true },
+        'Elimina'
+      );
+      if (selection === 'Elimina') {
+        await this._handleDelete(profileName);
+      }
+    } catch (err) {
+      this._postToast('error', errorMessage(err));
+    }
+  }
+
+  private async _requestRename(name: string) {
+    try {
+      const profileName = normalizeProfileName(name);
+      const newName = await vscode.window.showInputBox({
+        prompt: `Nuovo nome per il profilo "${profileName}":`,
+        value: profileName
+      });
+      if (newName !== undefined && newName.trim() !== '' && newName.trim() !== profileName) {
+        await this._handleRename(profileName, newName);
+      }
+    } catch (err) {
+      this._postToast('error', errorMessage(err));
     }
   }
 }
@@ -217,7 +385,8 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
 
 async function getSqliteValue(key: string): Promise<string | null> {
   try {
-    const { stdout } = await execAsync(`sqlite3 "${VSCDB_PATH}" "SELECT value FROM ItemTable WHERE key='${key}';"`);
+    const query = `SELECT value FROM ItemTable WHERE key='${escapeSqlValue(key)}';`;
+    const { stdout } = await execFileAsync('sqlite3', [VSCDB_PATH, query]);
     return stdout.trim() || null;
   } catch (err) {
     console.error(`Error reading ${key} from SQLite:`, err);
@@ -226,77 +395,151 @@ async function getSqliteValue(key: string): Promise<string | null> {
 }
 
 async function checkIsLoggedIn(): Promise<boolean> {
-  const oauthToken = await getSqliteValue('antigravityUnifiedStateSync.oauthToken');
-  if (oauthToken) {
-    try {
-      const decoded = Buffer.from(oauthToken, 'base64').toString('utf8');
-      if (decoded.includes('"state":"signedIn"')) return true;
-    } catch (e) {}
-  }
-  
-  const userStatus = await getSqliteValue('antigravityUnifiedStateSync.userStatus');
-  if (userStatus) {
-    try {
-      const decoded = Buffer.from(userStatus, 'base64').toString('utf8');
-      if (decoded.includes('"state":"signedIn"')) return true;
-    } catch (e) {}
-  }
-  
-  return false;
+  return isSignedInState(await getCurrentIdeState());
 }
 
 async function getSavedProfiles(): Promise<string[]> {
-  await fs.ensureDir(PROFILES_DIR);
+  await ensureSecureDir(PROFILES_DIR);
   const items = await fs.readdir(PROFILES_DIR);
   const profiles: string[] = [];
   for (const item of items) {
     if (item.startsWith('_')) { continue; }
-    const stat = await fs.stat(path.join(PROFILES_DIR, item));
-    if (stat.isDirectory()) { profiles.push(item); }
+    try {
+      const { name, profilePath } = getProfilePath(item);
+      const stat = await fs.stat(profilePath);
+      if (stat.isDirectory()) { profiles.push(name); }
+    } catch (err) {
+      console.warn(`Skipping invalid profile entry "${item}":`, err);
+    }
   }
-  return profiles;
+  return profiles.sort((a, b) => a.localeCompare(b));
 }
 
-async function saveCurrentProfile(name: string) {
-  const targetPath = path.join(PROFILES_DIR, name);
-  await fs.ensureDir(targetPath);
+async function getCurrentIdeState(): Promise<IdeState> {
+  const oauthToken = await getSqliteValue(SQLITE_OAUTH_TOKEN_KEY);
+  const userStatus = await getSqliteValue(SQLITE_USER_STATUS_KEY);
+  return { oauthToken, userStatus };
+}
 
-  if (await fs.pathExists(BROWSER_PROFILE_PATH)) {
-    await fs.copy(BROWSER_PROFILE_PATH, targetPath);
+function isSignedInState(state: IdeState): boolean {
+  for (const value of [state.oauthToken, state.userStatus]) {
+    if (!value) { continue; }
+    try {
+      const decoded = Buffer.from(value, 'base64').toString('utf8');
+      if (decoded.includes('"state":"signedIn"')) {
+        return true;
+      }
+    } catch (err) {
+      console.warn('Unable to decode Antigravity auth state:', err);
+    }
   }
 
-  const oauthToken = await getSqliteValue('antigravityUnifiedStateSync.oauthToken');
-  const userStatus = await getSqliteValue('antigravityUnifiedStateSync.userStatus');
-  
-  const loggedIn = await checkIsLoggedIn();
-  if (!loggedIn) {
+  return false;
+}
+
+async function moveWithRollback(source: string, destination: string, rollbackPath: string) {
+  let movedExisting = false;
+
+  try {
+    if (await fs.pathExists(rollbackPath)) {
+      await fs.remove(rollbackPath);
+    }
+    if (await fs.pathExists(destination)) {
+      await fs.move(destination, rollbackPath);
+      movedExisting = true;
+    }
+    await fs.move(source, destination);
+    if (movedExisting) {
+      await fs.remove(rollbackPath);
+    }
+  } catch (err) {
+    if (!await fs.pathExists(destination) && movedExisting && await fs.pathExists(rollbackPath)) {
+      await fs.move(rollbackPath, destination);
+    }
+    throw err;
+  } finally {
+    if (await fs.pathExists(source)) {
+      await fs.remove(source);
+    }
+    if (await fs.pathExists(rollbackPath)) {
+      await fs.remove(rollbackPath);
+    }
+  }
+}
+
+async function saveCurrentProfile(name: string): Promise<string> {
+  const { name: profileName, profilePath: targetPath } = getProfilePath(name);
+  await ensureSqliteAvailable();
+  const state = await getCurrentIdeState();
+
+  if (!isSignedInState(state)) {
     throw new Error("Nessuna sessione Google attiva trovata nell'IDE. Fai prima il login.");
   }
 
-  const state: IdeState = { oauthToken, userStatus };
-  await fs.writeJson(path.join(targetPath, 'ide_state.json'), state, { spaces: 2 });
+  await ensureSecureDir(PROFILES_DIR);
+  const stagingPath = getInternalPath('save');
+  const rollbackPath = getInternalPath('rollback');
+
+  try {
+    await ensureSecureDir(stagingPath);
+    if (await fs.pathExists(BROWSER_PROFILE_PATH)) {
+      await fs.copy(BROWSER_PROFILE_PATH, stagingPath);
+    }
+    await writeSecureJson(path.join(stagingPath, 'ide_state.json'), state);
+    await hardenProfileDirectory(stagingPath);
+    await moveWithRollback(stagingPath, targetPath, rollbackPath);
+    await hardenProfileDirectory(targetPath);
+    return profileName;
+  } finally {
+    if (await fs.pathExists(stagingPath)) {
+      await fs.remove(stagingPath);
+    }
+    if (await fs.pathExists(rollbackPath)) {
+      await fs.remove(rollbackPath);
+    }
+  }
 }
 
 async function switchProfile(name: string) {
-  const targetPath = path.join(PROFILES_DIR, name);
+  const { profilePath: targetPath } = getProfilePath(name);
+  await ensureSqliteAvailable();
   if (!await fs.pathExists(targetPath)) { throw new Error('Il profilo selezionato non esiste.'); }
+  const targetStat = await fs.stat(targetPath);
+  if (!targetStat.isDirectory()) { throw new Error('Il profilo selezionato non è valido.'); }
   
   const statePath = path.join(targetPath, 'ide_state.json');
+  if (!await fs.pathExists(statePath)) {
+    throw new Error('Il profilo selezionato non contiene lo stato di autenticazione.');
+  }
 
   const tempBackup = path.join(PROFILES_DIR, '_backup_temp');
-  if (await fs.pathExists(BROWSER_PROFILE_PATH)) {
-    if (await fs.pathExists(tempBackup)) { await fs.remove(tempBackup); }
-    await fs.move(BROWSER_PROFILE_PATH, tempBackup);
+  if (await fs.pathExists(tempBackup)) { await fs.remove(tempBackup); }
+
+  try {
+    if (await fs.pathExists(BROWSER_PROFILE_PATH)) {
+      await fs.move(BROWSER_PROFILE_PATH, tempBackup);
+    }
+    await fs.copy(targetPath, BROWSER_PROFILE_PATH);
+    await chmodIfSupported(BROWSER_PROFILE_PATH, SECURE_DIR_MODE);
+  } catch (err) {
+    if (await fs.pathExists(BROWSER_PROFILE_PATH)) {
+      await fs.remove(BROWSER_PROFILE_PATH);
+    }
+    if (await fs.pathExists(tempBackup)) {
+      await fs.move(tempBackup, BROWSER_PROFILE_PATH);
+    }
+    throw err;
   }
-  await fs.copy(targetPath, BROWSER_PROFILE_PATH);
 
   const scriptContent = `
-const { execSync } = require('child_process');
+const { execFileSync, execSync, spawn } = require('child_process');
 const fs = require('fs');
 const os = require('os');
 const vscdbPath = process.argv[2];
 const ideStatePath = process.argv[3];
-const appPath = process.argv[4];
+const activeProfilePath = process.argv[4];
+const backupPath = process.argv[5];
+const appPath = process.argv[6];
 
 const isMac = os.platform() === 'darwin';
 const isWin = os.platform() === 'win32';
@@ -362,22 +605,50 @@ if (isWin) {
     try { execSync('sleep 0.8'); } catch(e) {}
 }
 
-if (fs.existsSync(ideStatePath)) {
-    const state = JSON.parse(fs.readFileSync(ideStatePath, 'utf8'));
-    function setSqlite(key, val) {
-        const escaped = val.replace(/'/g, "''");
-        try {
-            const count = execSync(\`sqlite3 "\${vscdbPath}" "SELECT count(*) FROM ItemTable WHERE key='\${key}';"\`).toString().trim();
-            if (count === '0') {
-                execSync(\`sqlite3 "\${vscdbPath}" "INSERT INTO ItemTable (key, value) VALUES ('\${key}', '\${escaped}');"\`);
-            } else {
-                execSync(\`sqlite3 "\${vscdbPath}" "UPDATE ItemTable SET value='\${escaped}' WHERE key='\${key}';"\`);
-            }
-        } catch(e) {}
+function sqlString(value) {
+    return "'" + String(value).replace(/'/g, "''") + "'";
+}
+
+function restoreBrowserProfile() {
+    if (!backupPath || !fs.existsSync(backupPath)) {
+        return;
+    }
+    try {
+        if (fs.existsSync(activeProfilePath)) {
+            fs.rmSync(activeProfilePath, { recursive: true, force: true });
+        }
+        fs.renameSync(backupPath, activeProfilePath);
+    } catch(e) {}
+}
+
+function cleanupBackup() {
+    if (backupPath && fs.existsSync(backupPath)) {
+        try { fs.rmSync(backupPath, { recursive: true, force: true }); } catch(e) {}
+    }
+}
+
+try {
+    if (!fs.existsSync(ideStatePath)) {
+        throw new Error('Missing ide_state.json');
     }
 
-    if (state.oauthToken) setSqlite('antigravityUnifiedStateSync.oauthToken', state.oauthToken);
-    if (state.userStatus) setSqlite('antigravityUnifiedStateSync.userStatus', state.userStatus);
+    const state = JSON.parse(fs.readFileSync(ideStatePath, 'utf8'));
+    const pairs = [
+        ['${SQLITE_OAUTH_TOKEN_KEY}', state.oauthToken],
+        ['${SQLITE_USER_STATUS_KEY}', state.userStatus]
+    ];
+    const statements = ['BEGIN IMMEDIATE;'];
+    for (const [key, value] of pairs) {
+        statements.push(\`DELETE FROM ItemTable WHERE key=\${sqlString(key)};\`);
+        if (value !== null && value !== undefined) {
+            statements.push(\`INSERT INTO ItemTable (key, value) VALUES (\${sqlString(key)}, \${sqlString(value)});\`);
+        }
+    }
+    statements.push('COMMIT;');
+    execFileSync('sqlite3', [vscdbPath, statements.join('\\n')], { stdio: 'ignore' });
+    cleanupBackup();
+} catch(e) {
+    restoreBrowserProfile();
 }
 
 // Clean environment variables before restarting to prevent Launch Services issues
@@ -389,14 +660,13 @@ for (const key in process.env) {
 
 try {
     if (isMac) {
-        const appMatch = appPath.match(/(.*\.app)/);
+        const appMatch = appPath.match(/(.*\\.app)/);
         if (appMatch) {
-            execSync(\`open -n "\${appMatch[1]}"\`);
+            execFileSync('open', ['-n', appMatch[1]]);
         } else {
-            execSync('open -n -a "Antigravity IDE"');
+            execFileSync('open', ['-n', '-a', 'Antigravity IDE']);
         }
     } else {
-        const { spawn } = require('child_process');
         const child = spawn(appPath, [], {
             detached: true,
             stdio: 'ignore'
@@ -408,11 +678,15 @@ try {
 
   const scriptPath = path.join(PROFILES_DIR, 'switcher.js');
   await fs.writeFile(scriptPath, scriptContent);
+  await chmodIfSupported(scriptPath, SECURE_FILE_MODE);
 
-  const { spawn } = require('child_process');
-  const child = spawn('node', [scriptPath, VSCDB_PATH, statePath, process.execPath || 'Antigravity IDE'], {
+  const child = spawn(process.execPath, [scriptPath, VSCDB_PATH, statePath, BROWSER_PROFILE_PATH, tempBackup, process.execPath || 'Antigravity IDE'], {
     detached: true,
-    stdio: 'ignore'
+    stdio: 'ignore',
+    env: {
+      ...process.env,
+      ELECTRON_RUN_AS_NODE: '1'
+    }
   });
   child.unref();
 
@@ -422,15 +696,35 @@ try {
 // -------------------------------------------------------------------
 // WebView HTML
 // -------------------------------------------------------------------
+function getNonce(): string {
+  const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+  let nonce = '';
+  for (let i = 0; i < 32; i++) {
+    nonce += chars.charAt(Math.floor(Math.random() * chars.length));
+  }
+  return nonce;
+}
+
+function toScriptJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e')
+    .replace(/&/g, '\\u0026')
+    .replace(/\u2028/g, '\\u2028')
+    .replace(/\u2029/g, '\\u2029');
+}
+
 function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
-  const profilesJson = JSON.stringify(profiles);
+  const nonce = getNonce();
+  const profilesJson = toScriptJson(profiles);
   return `<!DOCTYPE html>
-<html lang="it">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Account Switcher</title>
-  <style>
+	<html lang="it">
+	<head>
+	  <meta charset="UTF-8"/>
+	  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+	  <title>Account Switcher</title>
+	  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; script-src 'nonce-${nonce}';"/>
+	  <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     :root {
       --radius-sm: 4px;
@@ -568,48 +862,80 @@ function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
   <div class="profiles-list" id="profilesList"></div>
   <div class="toast-container" id="toastContainer"></div>
 
-  <script>
-    const vscode = acquireVsCodeApi();
-    const COLORS = ['#4d78cc', '#6b5b95', '#b565a7', '#009688', '#e91e63', '#ff9800'];
-    function getColor(name) {
-      let h = 0; for (let i=0;i<name.length;i++){h=name.charCodeAt(i)+((h<<5)-h);}
-      return COLORS[Math.abs(h)%COLORS.length];
-    }
-    function getInitials(name){return name.split(/\\s+/).map(w=>w[0]).join('').toUpperCase().slice(0,2);}
-    function esc(str){return str.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');}
-    function escJs(str){return str.replace(/\\\\/g,'\\\\\\\\').replace(/'/g,"\\\\\'");}
+	  <script nonce="${nonce}">
+	    const vscode = acquireVsCodeApi();
+	    const COLORS = ['#4d78cc', '#6b5b95', '#b565a7', '#009688', '#e91e63', '#ff9800'];
+	    const SWITCH_ICON = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 12c0-4.4 3.6-8 8-8 2.2 0 4.2.9 5.7 2.3L20 9"/><path d="M15 9h5V4"/><path d="M20 12c0 4.4-3.6 8-8 8-2.2 0-4.2-.9-5.7-2.3L4 15"/><path d="M9 15H4v5"/></svg>';
+	    function getColor(name) {
+	      let h = 0; for (let i=0;i<name.length;i++){h=name.charCodeAt(i)+((h<<5)-h);}
+	      return COLORS[Math.abs(h)%COLORS.length];
+	    }
+	    function getInitials(name){return name.trim().split(/\\s+/).filter(Boolean).map(w=>w[0]).join('').toUpperCase().slice(0,2);}
+	    function createProfileButton(action, title, content) {
+	      const button = document.createElement('button');
+	      button.className = 'btn-icon';
+	      button.type = 'button';
+	      button.title = title;
+	      button.dataset.action = action;
+	      if (action === 'switch') {
+	        button.innerHTML = content;
+	      } else {
+	        button.textContent = content;
+	      }
+	      return button;
+	    }
 
-    function renderProfiles(profiles) {
-      const list = document.getElementById('profilesList');
-      if (!profiles || profiles.length === 0) {
-        list.innerHTML = \`<div class="empty-state">Nessun profilo salvato.</div>\`;
-        return;
-      }
-      list.innerHTML = profiles.map(name => \`
-        <div class="profile-card">
-          <div class="profile-avatar" style="background:\${getColor(name)}">\${getInitials(name)}</div>
-          <div class="profile-info">
-            <div class="profile-name">\${esc(name)}</div>
-            <div class="profile-sub">Profilo Google</div>
-          </div>
-          <div class="profile-actions">
-            <button class="btn-icon" title="Switch" onclick="switchProfile('\${escJs(name)}')">
-              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 12c0-4.4 3.6-8 8-8 2.2 0 4.2.9 5.7 2.3L20 9"/><path d="M15 9h5V4"/><path d="M20 12c0 4.4-3.6 8-8 8-2.2 0-4.2-.9-5.7-2.3L4 15"/><path d="M9 15H4v5"/></svg>
-            </button>
-            <button class="btn-icon" title="Rinomina" onclick="promptRenameProfile('\${escJs(name)}')">✏️</button>
-            <button class="btn-icon" title="Elimina" onclick="promptDeleteProfile('\${escJs(name)}')">🗑</button>
-          </div>
-        </div>\`).join('');
-    }
+	    function renderProfiles(profiles) {
+	      const list = document.getElementById('profilesList');
+	      list.replaceChildren();
+	      if (!profiles || profiles.length === 0) {
+	        const empty = document.createElement('div');
+	        empty.className = 'empty-state';
+	        empty.textContent = 'Nessun profilo salvato.';
+	        list.appendChild(empty);
+	        return;
+	      }
+	      for (const name of profiles) {
+	        const card = document.createElement('div');
+	        card.className = 'profile-card';
 
-    function showToast(type, message) {
-      const c = document.getElementById('toastContainer');
-      const t = document.createElement('div');
-      t.className = 'toast ' + type;
-      t.innerHTML = esc(message);
-      c.appendChild(t);
-      setTimeout(() => t.remove(), 3000);
-    }
+	        const avatar = document.createElement('div');
+	        avatar.className = 'profile-avatar';
+	        avatar.style.background = getColor(name);
+	        avatar.textContent = getInitials(name);
+
+	        const info = document.createElement('div');
+	        info.className = 'profile-info';
+	        const profileName = document.createElement('div');
+	        profileName.className = 'profile-name';
+	        profileName.textContent = name;
+	        const profileSub = document.createElement('div');
+	        profileSub.className = 'profile-sub';
+	        profileSub.textContent = 'Profilo Google';
+	        info.append(profileName, profileSub);
+
+	        const actions = document.createElement('div');
+	        actions.className = 'profile-actions';
+	        const switchButton = createProfileButton('switch', 'Switch', SWITCH_ICON);
+	        const renameButton = createProfileButton('rename', 'Rinomina', '✏️');
+	        const deleteButton = createProfileButton('delete', 'Elimina', '🗑');
+	        for (const button of [switchButton, renameButton, deleteButton]) {
+	          button.dataset.name = name;
+	        }
+	        actions.append(switchButton, renameButton, deleteButton);
+	        card.append(avatar, info, actions);
+	        list.appendChild(card);
+	      }
+	    }
+
+	    function showToast(type, message) {
+	      const c = document.getElementById('toastContainer');
+	      const t = document.createElement('div');
+	      t.className = 'toast ' + (type === 'error' ? 'error' : 'success');
+	      t.textContent = message;
+	      c.appendChild(t);
+	      setTimeout(() => t.remove(), 3000);
+	    }
 
     const saveBtn = document.getElementById('saveBtn');
     if (saveBtn) {
@@ -621,19 +947,27 @@ function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
         input.value = '';
       });
       document.getElementById('profileNameInput').addEventListener('keydown', e => {
-        if (e.key === 'Enter') saveBtn.click();
-      });
-    }
-    
-    function switchProfile(name){ vscode.postMessage({command:'switchProfile', name}); }
-    
-    function promptDeleteProfile(name) {
-      vscode.postMessage({command:'requestDeleteProfile', name});
-    }
+	        if (e.key === 'Enter') saveBtn.click();
+	      });
+	    }
 
-    function promptRenameProfile(name) {
-      vscode.postMessage({command:'requestRenameProfile', name});
-    }
+	    document.getElementById('profilesList').addEventListener('click', event => {
+	      const target = event.target;
+	      if (!(target instanceof Element)) return;
+	      const button = target.closest('button[data-action]');
+	      if (!button) return;
+	      const name = button.dataset.name;
+	      if (!name) return;
+	      if (button.dataset.action === 'switch') {
+	        vscode.postMessage({command:'switchProfile', name});
+	      }
+	      if (button.dataset.action === 'rename') {
+	        vscode.postMessage({command:'requestRenameProfile', name});
+	      }
+	      if (button.dataset.action === 'delete') {
+	        vscode.postMessage({command:'requestDeleteProfile', name});
+	      }
+	    });
 
     window.addEventListener('message', event => {
       const msg = event.data;
@@ -661,11 +995,12 @@ function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
 function getLoadingWebviewContent(): string {
   return `<!DOCTYPE html>
 <html lang="it">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
-  <title>Account Switcher</title>
-  <style>
+	<head>
+	  <meta charset="UTF-8"/>
+	  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+	  <title>Account Switcher</title>
+	  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline';"/>
+	  <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body {
       font-family: var(--vscode-font-family);

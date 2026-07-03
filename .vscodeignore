@@ -1,0 +1,13 @@
+.github/**
+.vscode/**
+src/**
+node_modules/**
+dist/**/*.map
+*.vsix
+.gitignore
+sidebar-icon.svg
+debug-auth.js
+test.js
+tsconfig.json
+webpack.config.js
+package-lock.json
