@@ -63,7 +63,8 @@
         {
           "type": "webview",
           "id": "antigravity.accountSwitcherView",
-          "name": "Account Switcher"
+          "name": "Antigravity IDE - Account Switcher",
+          "icon": "icon.png"
         }
       ]
     },
