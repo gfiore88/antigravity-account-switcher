@@ -87,6 +87,18 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
 
     this._renderView();
 
+    webviewView.onDidChangeVisibility(() => {
+      if (webviewView.visible) {
+        this._renderView();
+      }
+    });
+
+    vscode.window.onDidChangeWindowState((state) => {
+      if (state.focused && this._view?.visible) {
+        this._renderView();
+      }
+    });
+
     webviewView.webview.onDidReceiveMessage(async (message) => {
       switch (message.command) {
         case 'saveProfile':
@@ -122,6 +134,14 @@ class AccountSwitcherViewProvider implements vscode.WebviewViewProvider {
 
   private async _renderView() {
     if (!this._view) { return; }
+    
+    // Show a loading spinner
+    this._view.webview.html = getLoadingWebviewContent();
+
+    // Small delay to ensure the loading screen is painted and visible to the user,
+    // otherwise the sqlite query might be too fast and the IPC messages might coalesce.
+    await new Promise(resolve => setTimeout(resolve, 400));
+
     const profiles = await getSavedProfiles();
     const loggedIn = await checkIsLoggedIn();
     this._view.webview.html = getWebviewContent(profiles, loggedIn);
@@ -465,18 +485,21 @@ function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
   </div>
 
   <div class="section-label">Salva sessione corrente</div>
-  ${isLoggedIn ? `
-  <div class="add-card">
-    <input class="input-field" id="profileNameInput" type="text" placeholder="Nome profilo" maxlength="40"/>
-    <button class="btn" id="saveBtn">Salva Profilo</button>
+  
+  <div id="saveFormContainer" style="display: ${isLoggedIn ? 'block' : 'none'};">
+    <div class="add-card">
+      <input class="input-field" id="profileNameInput" type="text" placeholder="Nome profilo" maxlength="40"/>
+      <button class="btn" id="saveBtn">Salva Profilo</button>
+    </div>
   </div>
-  ` : `
-  <div class="add-card" style="padding: 10px; background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); border-radius: var(--radius-sm); margin-bottom: 20px;">
-    <p style="font-size: 11px; color: var(--vscode-foreground); margin: 0; line-height: 1.4;">
-      ⚠️ Effettua prima il login con Google in Antigravity IDE per poter salvare il profilo.
-    </p>
+  
+  <div id="loginWarningContainer" style="display: ${isLoggedIn ? 'none' : 'block'};">
+    <div class="add-card" style="padding: 10px; background: var(--vscode-inputValidation-warningBackground); border: 1px solid var(--vscode-inputValidation-warningBorder); border-radius: var(--radius-sm); margin-bottom: 20px;">
+      <p style="font-size: 11px; color: var(--vscode-foreground); margin: 0; line-height: 1.4;">
+        ⚠️ Effettua prima il login con Google in Antigravity IDE per poter salvare il profilo.
+      </p>
+    </div>
   </div>
-  `}
 
   <div class="section-label">Profili Salvati</div>
   <div class="profiles-list" id="profilesList"></div>
@@ -553,10 +576,67 @@ function getWebviewContent(profiles: string[], isLoggedIn: boolean): string {
       const msg = event.data;
       if (msg.command === 'profiles') renderProfiles(msg.profiles);
       if (msg.command === 'toast') showToast(msg.type, msg.message);
+      if (msg.command === 'updateAuthStatus') {
+        const saveForm = document.getElementById('saveFormContainer');
+        const loginWarning = document.getElementById('loginWarningContainer');
+        if (msg.isLoggedIn) {
+          saveForm.style.display = 'block';
+          loginWarning.style.display = 'none';
+        } else {
+          saveForm.style.display = 'none';
+          loginWarning.style.display = 'block';
+        }
+      }
     });
 
     renderProfiles(${profilesJson});
   </script>
+</body>
+</html>`;
+}
+
+function getLoadingWebviewContent(): string {
+  return `<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>Account Switcher</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: var(--vscode-font-family);
+      font-size: var(--vscode-font-size);
+      color: var(--vscode-foreground);
+      background: var(--vscode-editor-background);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+    }
+    .spinner {
+      width: 24px;
+      height: 24px;
+      border: 3px solid var(--vscode-panel-border);
+      border-top: 3px solid var(--vscode-button-background);
+      border-radius: 50%;
+      animation: spin 1s linear infinite;
+      margin-bottom: 12px;
+    }
+    @keyframes spin {
+      0% { transform: rotate(0deg); }
+      100% { transform: rotate(360deg); }
+    }
+    .loading-text {
+      font-size: 12px;
+      color: var(--vscode-descriptionForeground);
+    }
+  </style>
+</head>
+<body>
+  <div class="spinner"></div>
+  <div class="loading-text">Caricamento stato...</div>
 </body>
 </html>`;
 }
